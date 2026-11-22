@@ -1,0 +1,94 @@
+name: Attach reviewed Windows build to draft
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: reviewed-windows-draft-upload
+  cancel-in-progress: false
+jobs:
+  attach:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Verify reviewed bytes and attach only to draft
+        env:
+          SOURCE_ARCHIVE_URL: ${{ secrets.REVIEWED_WINDOWS_SOURCE_URL }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, io, json, os, ssl, sys, urllib.parse, urllib.request, zipfile
+          ARCHIVE_SHA = 'f98d0c9b0dfdc997d0a377f4ffcc51849c65fbb24f3155df83e8ca5403f6472d'
+          EXE_SHA = 'bdf989f13cd0b6c2d3ce85b8195a211b551d652a478c95521e9e8ab402e4ae58'
+          EXE_NAME = 'Notes-Hamza-Studio-Windows-build30.exe'
+          TAG = 'windows-build30-experimental'
+          TITLE = 'Notes Hamza Studio - Windows build 30 - Experimental'
+          def fail(message):
+              print(message, file=sys.stderr)
+              raise SystemExit(1)
+          def request_json(url, token, data=None, content_type=None):
+              parsed = urllib.parse.urlparse(url)
+              if parsed.scheme != 'https' or parsed.hostname not in ('api.github.com', 'uploads.github.com'):
+                  fail('Unexpected API host. No upload attempted.')
+              headers = {'Authorization':'Bearer '+token, 'Accept':'application/vnd.github+json', 'X-GitHub-Api-Version':'2022-11-28', 'User-Agent':'reviewed-draft-distribution'}
+              if content_type: headers['Content-Type'] = content_type
+              req = urllib.request.Request(url, data=data, headers=headers)
+              with urllib.request.urlopen(req, timeout=90) as response:
+                  return json.load(response)
+          try:
+              source = os.environ.get('SOURCE_ARCHIVE_URL', '')
+              token = os.environ.get('GH_TOKEN', '')
+              repo = os.environ.get('GITHUB_REPOSITORY', '')
+              if not source or not token or repo != 'Hamzakolk/notes-hamza-downloads':
+                  fail('Required scoped configuration is missing.')
+              parsed = urllib.parse.urlparse(source)
+              if parsed.scheme != 'https' or not parsed.hostname or not parsed.hostname.startswith('productionresults') or not parsed.hostname.endswith('.blob.core.windows.net') or not parsed.path.startswith('/actions-results/'):
+                  fail('Unexpected source host. No download attempted.')
+              # The secret never enters a command-line argument or output.
+              with urllib.request.urlopen(source, timeout=90) as response:
+                  if response.url != source:
+                      fail('Unexpected source redirect.')
+                  archive = response.read(82360285)
+              if len(archive) != 82360284 or hashlib.sha256(archive).hexdigest() != ARCHIVE_SHA:
+                  fail('Archive verification failed. No upload attempted.')
+              with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+                  entries = bundle.infolist()
+                  if len(entries) != 1 or entries[0].filename != 'NotesHamza_Setup.exe' or entries[0].file_size != 82889787:
+                      fail('Archive contents do not match the reviewed consumer build.')
+                  exe = bundle.read(entries[0])
+              if len(exe) != 82889787 or hashlib.sha256(exe).hexdigest() != EXE_SHA:
+                  fail('EXE verification failed. No upload attempted.')
+              releases = request_json('https://api.github.com/repos/'+repo+'/releases?per_page=100', token)
+              matches = [r for r in releases if r.get('tag_name') == TAG and r.get('name') == TITLE]
+              if len(matches) != 1 or matches[0].get('draft') is not True or matches[0].get('prerelease') is not True:
+                  fail('Expected private draft pre-release was not found. Nothing published.')
+              release = matches[0]
+              if release.get('id') != 454662230:
+                  fail('Unexpected release identity. No upload attempted.')
+              existing = [a for a in release.get('assets', []) if a.get('name') == EXE_NAME]
+              if existing:
+                  if len(existing) == 1 and existing[0].get('digest') == 'sha256:'+EXE_SHA and existing[0].get('state') == 'uploaded':
+                      print('Exact verified EXE is already attached to the draft. Nothing changed.')
+                      raise SystemExit(0)
+                  fail('An existing asset must be reviewed. It was not overwritten.')
+              endpoint = release['upload_url'].split('{', 1)[0]
+              if urllib.parse.urlparse(endpoint).path != '/repos/'+repo+'/releases/'+str(release['id'])+'/assets':
+                  fail('Unexpected upload path. No upload attempted.')
+              result = request_json(endpoint+'?name='+urllib.parse.quote(EXE_NAME), token, exe, 'application/vnd.microsoft.portable-executable')
+              if result.get('name') != EXE_NAME or result.get('size') != len(exe) or result.get('state') != 'uploaded' or result.get('digest') != 'sha256:'+EXE_SHA:
+                  fail('Upload response requires inspection. Release was not published.')
+              final_release = request_json('https://api.github.com/repos/'+repo+'/releases/454662230', token)
+              if final_release.get('draft') is not True or final_release.get('prerelease') is not True or final_release.get('tag_name') != TAG or final_release.get('name') != TITLE:
+                  fail('Final draft state requires inspection.')
+              print('Verified consumer EXE attached to DRAFT only. Size: 82889787 bytes.')
+              print('SHA-256: '+EXE_SHA)
+              print('No release was published. Remove the temporary source secret now.')
+          except SystemExit:
+              raise
+          except BaseException:
+              # Do not reveal source URLs, authorization headers, response bodies,
+              # or exception details in public workflow logs.
+              fail('Distribution step failed. Inspect draft asset state before retrying.')
+          PY
